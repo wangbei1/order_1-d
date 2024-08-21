@@ -2,3 +2,7 @@
 	url  = https://gitee.com/jia_wei_nan/1-d-tokenizer
 	path = train_with_1D
 
+[submodule "train_without_1D"]
+	url  = https://gitee.com/jia_wei_nan/1-d-tokenizer
+	path = train_without_1D
+
