@@ -20,11 +20,11 @@ import torch
 
 from omegaconf import OmegaConf
 from modeling.titok import TiTok
-from modeling.titok_kl import TiTok_KL
+from modeling.titok_one_by_one import TiTok_one_by_one
 # from modeling.maskgit import ImageBert
 import math
 from functools import partial
-
+from modeling.titok_new import TiTok_new
 # step scheduler
 def fn_LinearWarmup(warmup_steps, step):
     if step < warmup_steps:  # linear warmup
@@ -67,19 +67,19 @@ def get_titok_tokenizer(config):
     # tokenizer.requires_grad_(False)
     return tokenizer
 
-def get_titok_tokenizer_kl_train(config):
-    tokenizer = TiTok_KL(config)
+def get_titok_tokenizer_one_by_one(config):
+    tokenizer = TiTok_one_by_one(config)
     # tokenizer.load_state_dict(torch.load(config.experiment.tokenizer_checkpoint, map_location="cpu"), strict=False)
     # tokenizer.eval()
     # tokenizer.requires_grad_(False)
     return tokenizer
 
-# def get_titok_generator(config):
-#     generator = ImageBert(config)
-#     generator.load_state_dict(torch.load(config.experiment.generator_checkpoint, map_location="cpu"))
-#     generator.eval()
-#     generator.requires_grad_(False)
-#     return generator
+def get_titok_tokenizer_new(config):
+    tokenizer = TiTok_new(config)
+    # tokenizer.load_state_dict(torch.load(config.experiment.tokenizer_checkpoint, map_location="cpu"), strict=False)
+    # tokenizer.eval()
+    # tokenizer.requires_grad_(False)
+    return tokenizer
 
 @torch.no_grad()
 def sample_fn(generator,

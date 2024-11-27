@@ -64,9 +64,10 @@ class ResidualAttentionBlock(nn.Module):
         return x
 
 
+
+
 def _expand_token(token, batch_size: int):
     return token.unsqueeze(0).expand(batch_size, -1, -1)
-
 
 class TiTokEncoder(nn.Module):
     def __init__(self, config):
@@ -74,74 +75,114 @@ class TiTokEncoder(nn.Module):
         self.config = config
         self.image_size = config.dataset.preprocessing.crop_size 
         self.patch_size = config.model.vq_model.vit_enc_patch_size
-        self.grid_size = self.image_size // self.patch_size
-        self.model_size = config.model.vq_model.vit_enc_model_size
-        self.num_latent_tokens = config.model.vq_model.num_latent_tokens
-        self.token_size = config.model.vq_model.token_size * 2
+        self.grid_size = self.image_size // self.patch_size  # 例如，256/32 = 8
+        self.model_size = config.model.vq_model.vit_enc_model_size  # 例如 'large'
+        self.num_latent_tokens = config.model.vq_model.num_latent_tokens  # 例如 32
+        self.token_size = config.model.vq_model.token_size  # 例如 12
 
-        self.width = {
-                "small": 512,
-                "base": 768,
-                "large": 1024,
-            }[self.model_size]
-        self.num_layers = {
-                "small": 8,
-                "base": 12,
-                "large": 24,
-            }[self.model_size]
+        # 将宽度调整为128，因为我们将通道分为32份
+        self.width = 128  
+        self.num_layers = config.model.vq_model.layers
         self.num_heads = {
-                "small": 8,
-                "base": 12,
-                "large": 16,
-            }[self.model_size]
+            "large": 2,
+        }[self.model_size]
         
+        # 调整patch_embed的输出为 width * num_latent_tokens 通道
         self.patch_embed = nn.Conv2d(
-            in_channels=3, out_channels=self.width,
-              kernel_size=self.patch_size, stride=self.patch_size, bias=True)
-        
+            in_channels=3, 
+            out_channels=self.width * self.num_latent_tokens,
+            kernel_size=self.patch_size, 
+            stride=self.patch_size, 
+            bias=True
+        )
+
+        # 初始化每个token的嵌入
         scale = self.width ** -0.5
-        self.class_embedding = nn.Parameter(scale * torch.randn(1, self.width))
+        self.class_embedding = nn.Parameter(
+            scale * torch.randn(self.num_latent_tokens, 1, self.width)
+        )
         self.positional_embedding = nn.Parameter(
-                scale * torch.randn(self.grid_size ** 2 + 1, self.width))
+            scale * torch.randn(self.num_latent_tokens, self.grid_size ** 2 + 1, self.width)
+        )
         self.latent_token_positional_embedding = nn.Parameter(
-            scale * torch.randn(self.num_latent_tokens, self.width))
+            scale * torch.randn(self.num_latent_tokens, self.width)
+        )
+
         self.ln_pre = nn.LayerNorm(self.width)
-        self.transformer = nn.ModuleList()
-        for i in range(self.num_layers):
-            self.transformer.append(ResidualAttentionBlock(
-                self.width, self.num_heads, mlp_ratio=4.0
-            ))
+
+        # 为每个token创建独立的transformer堆叠
+        self.transformers = nn.ModuleList([
+            nn.ModuleList([
+                ResidualAttentionBlock(self.width, self.num_heads, mlp_ratio=4.0)
+                for _ in range(self.num_layers)
+            ])
+            for _ in range(self.num_latent_tokens)
+        ])
+
         self.ln_post = nn.LayerNorm(self.width)
         self.conv_out = nn.Conv2d(self.width, self.token_size, kernel_size=1, bias=True)
 
     def forward(self, pixel_values, latent_tokens):
         batch_size = pixel_values.shape[0]
-        x = pixel_values
-        x = self.patch_embed(x)    # 3,256,256 -> 1024,16,16
-        x = x.reshape(x.shape[0], x.shape[1], -1)
-        x = x.permute(0, 2, 1) # shape = [*, grid ** 2, width]
-        # class embeddings and positional embeddings
-        x = torch.cat([_expand_token(self.class_embedding, x.shape[0]).to(x.dtype), x], dim=1)
-        x = x + self.positional_embedding.to(x.dtype) # shape = [*, grid ** 2 + 1, width]
         
+        # 第1步：将x分成32份
+        x = self.patch_embed(pixel_values)
+        x = x.view(
+            batch_size, 
+            self.num_latent_tokens, 
+            self.width, 
+            self.grid_size, 
+            self.grid_size
+        )
 
-        latent_tokens = _expand_token(latent_tokens, x.shape[0]).to(x.dtype)
-        latent_tokens = latent_tokens + self.latent_token_positional_embedding.to(x.dtype)
-        x = torch.cat([x, latent_tokens], dim=1)
+        prev_tokens = []
+        for i in range(self.num_latent_tokens):
+            # 单独处理每个token
+            x_i = x[:, i, :, :, :]  # 形状: [B, width, 8, 8]
+            x_i = x_i.reshape(x_i.shape[0], x_i.shape[1], -1).permute(0, 2, 1)
 
-        x = self.ln_pre(x)
-        x = x.permute(1, 0, 2)  # NLD -> LND
-        for i in range(self.num_layers):
-            x = self.transformer[i](x)
-        x = x.permute(1, 0, 2)  # LND -> NLD
-        
-        latent_tokens = x[:, 1+self.grid_size**2:]
-        latent_tokens = self.ln_post(latent_tokens)
-        # fake 2D shape
-        latent_tokens = latent_tokens.reshape(batch_size, self.width, self.num_latent_tokens, 1)
-        latent_tokens = self.conv_out(latent_tokens)
-        latent_tokens = latent_tokens.reshape(batch_size, self.token_size, 1, self.num_latent_tokens)
-        return latent_tokens # N 12 1 32
+            # 第2步：使用每个token的class和位置嵌入
+            #这一步可能有问题
+            class_embedding_i = _expand_token(self.class_embedding[i], batch_size)
+            x_i = torch.cat([class_embedding_i.to(x_i.dtype), x_i], dim=1)
+            x_i = x_i + self.positional_embedding[i].to(x_i.dtype)
+
+
+            # 第4步：连接先前生成的tokens
+            if i > 0:
+                prev_tokens_cat = torch.cat(prev_tokens, dim=1)
+                x_i = torch.cat([x_i, prev_tokens_cat], dim=1)
+
+            # 第5步：添加latent token位置嵌入
+            latent_token_i = _expand_token(latent_tokens[i], batch_size).to(x_i.dtype)
+            latent_token_i = latent_token_i + self.latent_token_positional_embedding[i].to(x_i.dtype)
+            x_i = torch.cat([x_i, latent_token_i], dim=1)
+
+
+
+            x_i = self.ln_pre(x_i)
+            x_i = x_i.permute(1, 0, 2)
+
+            # 使用独立的transformer层
+            for layer in self.transformers[i]:
+                x_i = layer(x_i)
+
+            x_i = x_i.permute(1, 0, 2)
+
+            # 第4步：提取最后位置的token
+            token_i = x_i[:, -1, :]
+            prev_tokens.append(token_i.unsqueeze(1))
+
+        # 第6步：连接所有tokens
+        tokens = torch.cat(prev_tokens, dim=1)
+        tokens = self.ln_post(tokens)
+        tokens = tokens.permute(0, 2, 1).unsqueeze(-1)
+        tokens = self.conv_out(tokens)
+        tokens = tokens.reshape(batch_size, self.token_size, 1, self.num_latent_tokens)
+
+        return tokens
+
+
     
 
 class TiTokDecoder(nn.Module):
@@ -162,7 +203,7 @@ class TiTokDecoder(nn.Module):
         self.num_layers = {
                 "small": 8,
                 "base": 12,
-                "large": 24,
+                "large": 30,
             }[self.model_size]
         self.num_heads = {
                 "small": 8,

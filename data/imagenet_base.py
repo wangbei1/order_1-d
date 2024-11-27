@@ -14,12 +14,19 @@ class ImagePaths(Dataset):
         self._length = len(paths)
 
         if split == "train" and not is_val:
+            # transforms_ = [
+            #     transforms.Resize(256),
+            #     transforms.RandomCrop(256),
+            #     transforms.RandomHorizontalFlip(p=0.5),
+            #     transforms.ToTensor(),
+            #     transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5])
+            # ]
             transforms_ = [
-                transforms.Resize(256),
-                transforms.RandomCrop(256),
-                transforms.RandomHorizontalFlip(p=0.5),
+           
+                transforms.Resize(256, interpolation=transforms.InterpolationMode.BICUBIC, antialias=True),
+                transforms.CenterCrop(256),
                 transforms.ToTensor(),
-                transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5])
+                transforms.Normalize([0., 0., 0.], [1., 1., 1.])
             ]
         else:
             transforms_ = [

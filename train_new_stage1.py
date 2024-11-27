@@ -8,6 +8,8 @@
 A minimal training script for DiT using PyTorch DDP.
 """
 import torch
+import torch.nn as nn
+
 # the first flag below was False when we tested this script but True makes A100 training a lot faster:
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
@@ -28,11 +30,15 @@ import logging
 import os
 import demo_util
 from demo_util import Scheduler_LinearWarmup, Scheduler_LinearWarmup_CosineDecay
+import torch.nn.functional as F
+from data.imagenet import ImageNetTrain,ImageNetValidation
+import random
 
 import data
 from data.faceshq import FFHQ
 from torchvision.utils import save_image
 
+from modeling.titok import PretrainedTokenizer
 #################################################################################
 #                             Training Helper Functions                         #
 #################################################################################
@@ -40,11 +46,16 @@ from torchvision.utils import save_image
 def configure_optimizers(model,opt_config,max_steps):
     # print(opt_config.learning_rate)
     lr = opt_config.learning_rate
-    opt_ae = torch.optim.Adam(list(model.encoder.parameters())+
+
+    opt_ae = torch.optim.Adam(
+        # list(model.parameters()),
+        
+        list(model.encoder.parameters())+
                                 list(model.decoder.parameters())+
-                                [model.latent_tokens]+
-                                list(model.pixel_quantize.parameters())+
-                                list(model.pixel_decoder.parameters()),
+                                list(model.quantize.parameters())+
+                                [model.latent_tokens],
+                                # [param for param in model.pixel_quantize.parameters() if param.requires_grad] +
+                                # [param for param in model.pixel_decoder.parameters() if param.requires_grad],
                                 lr=lr, betas=(0.5, 0.9))
     opt_disc = torch.optim.Adam(model.loss.discriminator.parameters(), lr=lr, betas=(0.5, 0.9))
     
@@ -83,14 +94,6 @@ def update_ema(ema_model, model, decay=0.9999):
         ema_params[name].mul_(decay).add_(param.data, alpha=1 - decay)
 
 
-def requires_grad(model, flag=True):
-    """
-    Set requires_grad flag for all parameters in a model.
-    """
-    for p in model.parameters():
-        p.requires_grad = flag
-
-
 def cleanup():
     """
     End DDP training.
@@ -98,6 +101,7 @@ def cleanup():
     dist.destroy_process_group()
 
 
+# 在 create_logger 函数中添加一个 FileHandler，写入每步的 loss 信息
 def create_logger(logging_dir):
     """
     Create a logger that writes to a log file and stdout.
@@ -137,13 +141,15 @@ def center_crop_arr(pil_image, image_size):
     return Image.fromarray(arr[crop_y: crop_y + image_size, crop_x: crop_x + image_size])
 
 
+
+
 #################################################################################
 #                                  Training Loop                                #
 #################################################################################
 
 def main(args):
     """
-    Trains a new DiT model.
+    Trains a new 1d model.
     """
     assert torch.cuda.is_available(), "Training currently requires at least one GPU."
 
@@ -164,17 +170,25 @@ def main(args):
         model_string_name = args.model       # e.g., large
         experiment_dir = f"{args.results_dir}/{experiment_index:03d}-{model_string_name}"  # Create an experiment folder
         checkpoint_dir = f"{experiment_dir}/checkpoints"  # Stores saved model checkpoints
+        
         os.makedirs(checkpoint_dir, exist_ok=True)
         recon_dir = f"{experiment_dir}/reconstructions"  # Stores image reconstructions
         os.makedirs(recon_dir, exist_ok=True)
         logger = create_logger(experiment_dir)
         logger.info(f"Experiment directory created at {experiment_dir}")
     else:
+        recon_dir = None
         logger = create_logger(None)
+
+    # 广播 recon_dir 给所有进程
+    recon_dir = [recon_dir] if rank == 0 else [None]
+    dist.broadcast_object_list(recon_dir, src=0)
+    recon_dir = recon_dir[0]
 
     # Create model:
     assert args.image_size % 8 == 0, "Image size must be divisible by 8 (for the VAE encoder)."
     latent_size = args.image_size // 8
+    # recon_dir = dist.broadcast_object_list([recon_dir], src=0)[0]
 
 
 
@@ -187,7 +201,46 @@ def main(args):
     #     transforms.ToTensor(),
     #     transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True)
     # ])
-    dataset =  FFHQ(split='train', resolution=256, is_eval=False)
+
+
+
+
+
+
+
+    # FFHQ
+    # dataset =  FFHQ(split='train', resolution=256, is_eval=False)
+    # sampler = DistributedSampler(
+    #     dataset,
+    #     num_replicas=dist.get_world_size(),
+    #     rank=rank,
+    #     shuffle=True,
+    #     seed=args.global_seed
+    # )
+    # loader = DataLoader(
+    #     dataset,
+    #     batch_size=int(args.global_batch_size // dist.get_world_size()),
+    #     shuffle=False,
+    #     sampler=sampler,
+    #     num_workers=args.num_workers,
+    #     pin_memory=True,
+    #     drop_last=True
+    # )
+    # logger.info(f"Dataset contains {len(dataset):,} images ({args.data_path})")
+    # max_steps = len(loader)
+
+#     transform = transforms.Compose(
+#     transforms.Resize(size=256, interpolation="bicubic", max_size=None, antialias=True),
+#     transforms.RandomCrop(size=(256, 256), padding=None),
+#     transforms.RandomHorizontalFlip(p=0.5),
+#     transforms.ToTensor(),
+#     transforms.Normalize(mean=[0.0, 0.0, 0.0], std=[1.0, 1.0, 1.0]),
+# )
+
+    # ImageNet
+    config_imagenet = {"is_eval": False, "size": 256, "sub_indices": 'data/image_net_idex/imagenet100.txt'}
+    
+    dataset = ImageNetTrain(config_imagenet)
     sampler = DistributedSampler(
         dataset,
         num_replicas=dist.get_world_size(),
@@ -195,39 +248,60 @@ def main(args):
         shuffle=True,
         seed=args.global_seed
     )
-    loader = DataLoader(
-        dataset,
-        batch_size=int(args.global_batch_size // dist.get_world_size()),
-        shuffle=False,
-        sampler=sampler,
-        num_workers=args.num_workers,
-        pin_memory=True,
-        drop_last=True
-    )
+    loader = DataLoader(dataset, 
+                         batch_size=int(args.global_batch_size // dist.get_world_size()),
+                         num_workers=args.num_workers, 
+                         sampler=sampler,
+                         shuffle=False,
+                         pin_memory=True,
+                         drop_last=True)
     logger.info(f"Dataset contains {len(dataset):,} images ({args.data_path})")
     max_steps = len(loader)
 
 
+
+
     config = demo_util.get_config(args.config)
-    model = demo_util.get_titok_tokenizer_kl_train(config).to(device)
-    for param in model.parameters():
-        param.requires_grad_(True)
-    model_without_ddp = model
-    # Note that parameter initialization is done within the DiT constructor
-    # ema = deepcopy(model).to(device)  # Create an EMA of the model for use after training
-    # requires_grad(ema, False)
-    logger.info(f"Titok Parameters: {sum(p.numel() for p in model.parameters()):,}")
+
+    # 初始化 VQModel
+    vqgan_lock = PretrainedTokenizer("/private/task/wubin/1d-tokenizer-main/ckpt/maskgit-vqgan-imagenet-f16-256.bin").to(device)
+
+
+
+    
+
+    model_train = demo_util.get_titok_tokenizer_new(config).to(device)
+
+    model_train.init_from_ckpt_de_and_qu("/private/task/wubin/1d-tokenizer-main/result/new/stage1/wo_ql/005-large/checkpoints/0030000.pt")
+
+
+
+    for param in model_train.parameters():
+        param.requires_grad_(True)   
+    for param in model_train.pixel_quantize.parameters():
+        param.requires_grad_(False)
+    for param in model_train.pixel_decoder.parameters():
+        param.requires_grad_(False)
+
+
+
+
+    for param in vqgan_lock.parameters():
+        param.requires_grad_(False)
+
+
+    model_without_ddp = model_train
+
+    logger.info(f"Titok Parameters: {sum(p.numel() for p in model_train.parameters()):,}")
     opt_config = config.model.optimizer
     [opt_ae, opt_disc], [scheduler_ae, scheduler_disc] = configure_optimizers(model_without_ddp,opt_config,max_steps)
     optimizer = [opt_ae, opt_disc]
 
 
-
-    # Prepare models for training:
-    # update_ema(ema, model, decay=0)  # Ensure EMA is initialized with synced weights
-    model.train()  # important! This enables embedding dropout for classifier-free guidance
+    model_train.train()  # important! This enables embedding dropout for classifier-free guidance
     # ema.eval()  # EMA model should always be in eval mode
-    model = DDP(model.to(device), device_ids=[rank])
+    model_train = DDP(model_train.to(device), device_ids=[rank])
+
 
     # Variables for monitoring/logging purposes:
     train_steps = 0
@@ -235,53 +309,57 @@ def main(args):
     running_loss = 0
     start_time = time()
 
+
     # for name, param in model.named_parameters():
     #     print(name, param.requires_grad)
+    loss_fct = nn.L1Loss(reduction="mean")
 
     logger.info(f"Training for {args.epochs} epochs...")
     for epoch in range(args.epochs):
         sampler.set_epoch(epoch)
         logger.info(f"Beginning epoch {epoch}...")
         for x in loader:
-            # print(x["image"])
             x = x["image"]
             # print(x)
             x = x.to(device)
-            # print(model)
-            reconstructed_image, posterior = model.module(x)
-            # print(last_layer)
-            for i in range(2):
-                if i == 0:
-                    opt_ae.zero_grad()
-                    aeloss, log_dict_ae = model.module.loss(x, reconstructed_image, posterior, i, train_steps, last_layer=model.module.get_last_layer(), split="train")
-                    # print(0)
-                    # print("Before step:",model.module.encoder.transformer[0].ln_1.weight)
-                    aeloss.backward()
-                    # print("Gradients:", model.module.encoder.transformer[0].ln_1.weight.grad)
-                    opt_ae.step()
-                    scheduler_ae["scheduler"].step()
-                    # print("After step:",model.module.encoder.transformer[0].ln_1.weight)
-                elif i == 1:
-                    opt_disc.zero_grad()
-                    disc_loss, log_dict_ae = model.module.loss(x, reconstructed_image, posterior, i, train_steps, last_layer=model.module.get_last_layer(), split="train")
-                    # print(1)
-                    disc_loss.backward()
-                    opt_disc.step()
-                    scheduler_disc["scheduler"].step()
-            # loss = aeloss + disc_loss
-            # update_ema(ema, model)
-            # print("Current learning rate (AE):", opt_ae.param_groups[0]['lr'])
-            # print("Current learning rate (Disc):", opt_disc.param_groups[0]['lr'])
+
+
+            x_1D,quantizer_loss = model_train.module.encode(x) # 这里的size是[b,12,1,32]
+            x_0_1D = model_train.module.decoder(x_1D) # 这里的size是[b,1024,16,16] 
+            x_0_1D=torch.einsum(
+                'nchw,cd->ndhw', x_0_1D.softmax(1),
+                vqgan_lock.quantize.embedding.weight) # 这里的size是[b,256,16,16]
+            
+            x_0_VQ,_=vqgan_lock.encode(x) # 这里的size是[b,256,16,16]
+            
+            # if train_steps<=5000:
+            #     reconstruction_loss=loss_fct(x_0_1D,x_0_VQ)
+            
+            # else:
+            reconstruction_loss = loss_fct(x_0_1D,x_0_VQ)+ quantizer_loss["quantizer_loss"]                     
+            
+            
+            total_loss = reconstruction_loss
+
+           
+            total_loss.backward()               
+            opt_ae.step()                      
+            opt_ae.zero_grad(set_to_none=True)  
+            scheduler_ae["scheduler"].step()
+
             # Log loss values:
-            running_loss += aeloss.item()
+            running_loss += total_loss.item()
             log_steps += 1
             train_steps += 1
-            if train_steps % args.log_every == 0:
 
-                with torch.no_grad():
-                    # Save reconstructions:
-                    save_image(x, f"{recon_dir}/input{train_steps:07d}.png", nrow=4)
-                    save_image(reconstructed_image, f"{recon_dir}/recon{train_steps:07d}.png", nrow=4)
+            if train_steps % args.log_every == 0:                          
+                # x = (x).clamp(0, 1)
+                # reconstructed_image = (reconstructed_image).clamp(0, 1)       
+                # with torch.no_grad():
+                #     # Save reconstructions:
+                #     save_image(x, f"{recon_dir}/{train_steps:07d}input.png", nrow=4)
+                #     save_image(reconstructed_image, f"{recon_dir}/{train_steps:07d}recon.png", nrow=4)                   
+
                 # Measure training speed:
                 torch.cuda.synchronize()
                 end_time = time()
@@ -290,7 +368,12 @@ def main(args):
                 avg_loss = torch.tensor(running_loss / log_steps, device=device)
                 dist.all_reduce(avg_loss, op=dist.ReduceOp.SUM)
                 avg_loss = avg_loss.item() / dist.get_world_size()
-                logger.info(f"(step={train_steps:07d}) Train Loss: {avg_loss:.4f}, Train Steps/Sec: {steps_per_sec:.2f}")
+                # 获取当前学习率
+                current_lr = scheduler_ae["scheduler"].optimizer.param_groups[0]['lr']
+                q=quantizer_loss["quantizer_loss"].item()
+                logger.info(f"(step={train_steps:07d}) Train Loss: {avg_loss:.4f}, Train Steps/Sec: {steps_per_sec:.2f}, Learning Rate: {current_lr:.8f}, Q_Loss:{q:.4f}")
+                with open("result/new/stage1/wo_ql/005-large/log.txt", "a") as log_file:
+                    log_file.write(f"(Epoch {epoch} Step {train_steps}) LR: {current_lr:.8f} Total Loss: {avg_loss:.4f}\n")
                 # Reset monitoring variables:
                 running_loss = 0
                 log_steps = 0
@@ -300,7 +383,7 @@ def main(args):
             if train_steps % args.ckpt_every == 0 and train_steps > 0:
                 if rank == 0:
                     checkpoint = {
-                        "model": model.state_dict(),
+                        "model": model_train.state_dict(),
                         # "ema": ema.state_dict(),
                         # "opt": opt.state_dict(),
                         # "args": args
@@ -311,7 +394,7 @@ def main(args):
                 dist.barrier()
 
 
-    model.eval()  # important! This disables randomized embedding dropout
+    model_train.eval()  # important! This disables randomized embedding dropout
     # do any sampling/FID calculation/etc. with ema (or model) in eval mode ...
 
     logger.info("Done!")
@@ -322,14 +405,15 @@ if __name__ == "__main__":
     # Default args here will train DiT-XL/2 with the hyperparameters we used in our paper (except training iters).
     parser = argparse.ArgumentParser()
     parser.add_argument("--data-path", type=str, default="")
-    parser.add_argument("--results-dir", type=str, default="results")
+    parser.add_argument("--results-dir", type=str, default="result/new/stage1/wo_ql")
     parser.add_argument("--model", type=str, default="large")
-    parser.add_argument("--config", type=str, default="configs/titok_vae_large_kl.yaml")
+    parser.add_argument("--config", type=str, default="configs/titok_new.yaml")
+    parser.add_argument("--config_VQGAN", type=str, default="configs/titok_vae_large.yaml")
     parser.add_argument("--image-size", type=int, choices=[256, 512], default=256)
-    parser.add_argument("--epochs", type=int, default=50)
-    parser.add_argument("--global-batch-size", type=int, default=24)
+    parser.add_argument("--epochs", type=int, default=300)
+    parser.add_argument("--global-batch-size", type=int, default=84)
     parser.add_argument("--global-seed", type=int, default=0)
-    parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--num-workers", type=int, default=16)
     parser.add_argument("--log-every", type=int, default=100)
     parser.add_argument("--ckpt-every", type=int, default=10000)
     args = parser.parse_args()

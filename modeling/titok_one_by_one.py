@@ -19,7 +19,7 @@ import torch
 import torch.nn as nn
 from einops import rearrange
 
-from .blocks import TiTokEncoder, TiTokDecoder
+from .blocks_one_by_one import TiTokEncoder, TiTokDecoder
 from .quantizer import VectorQuantizer
 from .maskgit_vqgan import Decoder as Pixel_Decoder
 from .maskgit_vqgan import Encoder as Pixel_Encoder
@@ -59,11 +59,13 @@ class PretrainedTokenizer(nn.Module):
         return quantized_states.detach(),codebook_indices.detach()
     
     @torch.no_grad()
-    def decode(self, quantized_states):
+    def decode(self, codes):
+        quantized_states = self.quantize.get_codebook_entry(codes)
         rec_images = self.decoder(quantized_states)
+        rec_images = torch.clamp(rec_images, 0.0, 1.0)
         return rec_images.detach()
-    
-class TiTok(nn.Module):
+
+class TiTok_one_by_one(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
@@ -113,6 +115,21 @@ class TiTok(nn.Module):
             module.bias.data.zero_()
             module.weight.data.fill_(1.0)
 
+    def remove_module_prefix(self,state_dict):
+        """Removes the 'module.' prefix from state_dict keys."""
+        new_state_dict = {}
+        for key, value in state_dict.items():
+            new_key = key.replace("module.", "")  # Remove 'module.' prefix
+            new_state_dict[new_key] = value
+        return new_state_dict
+
+    def init_from_ckpt_de_and_qu(self, path_decoder,ignore_keys=list()):
+        checkpoint = torch.load(path_decoder, map_location="cpu")
+        checkpoint_VQ=checkpoint["model"]
+        new_state_dict=self.remove_module_prefix(checkpoint_VQ)
+        self.load_state_dict(new_state_dict) 
+        print(f"Restored from {path_decoder}")
+
     def encode(self, x):
         z = self.encoder(pixel_values=x, latent_tokens=self.latent_tokens)
         z_quantized, result_dict = self.quantize(z)
@@ -123,8 +140,10 @@ class TiTok(nn.Module):
         quantized_states = torch.einsum(
             'nchw,cd->ndhw', decoded_latent.softmax(1),
             self.pixel_quantize.embedding.weight)
+        z_q, min_encoding_indices, loss=self.pixel_quantize(quantized_states)
+
         decoded = self.pixel_decoder(quantized_states)
-        return decoded
+        return decoded,loss
     
     def decode_tokens(self, tokens):
         tokens = tokens.squeeze(1)
@@ -134,6 +153,11 @@ class TiTok(nn.Module):
         if self.quantize.use_l2_norm:
             z_quantized = torch.nn.functional.normalize(z_quantized, dim=-1)
         z_quantized = rearrange(z_quantized, 'b h w c -> b c h w').contiguous()
+        decoded = self.decode(z_quantized)
+        return decoded
+    
+    def forward(self, x):
+        z_quantized, result_dict = self.encode(x)
         decoded = self.decode(z_quantized)
         return decoded
     

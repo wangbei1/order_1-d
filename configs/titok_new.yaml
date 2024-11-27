@@ -1,0 +1,40 @@
+# experiment:
+#     tokenizer_checkpoint: "ckpt/tokenizer_titok_l32.bin"
+#     generator_checkpoint: "ckpt/generator_titok_l32.bin"
+
+model:
+    vq_model:
+        codebook_size: 4096
+        token_size: 12
+        use_l2_norm: True
+        commitment_cost: 0.25
+        # vit arch
+        vit_enc_model_size: "large"
+        vit_dec_model_size: "large"
+        vit_enc_patch_size: 16
+        vit_dec_patch_size: 16
+        num_latent_tokens: 32
+        layers_x: 18
+        layers_token: 2
+        embedding_width: 1024
+        width: 256
+
+    lossconfig:
+      target: modeling.vqperceptual.VQLPIPSWithDiscriminator
+      params:
+        disc_start: 0
+        codebook_weight: 1.0
+        pixelloss_weight: 1.0
+        disc_factor: 1.0
+        disc_weight: 1.0
+        perceptual_weight: 1.0
+        disc_conditional: false
+        disc_loss: hinge
+        disc_weight_max: 0.75
+
+    optimizer:
+        learning_rate:  7e-6          # 初始学习率
+        min_learning_rate: 1e-7       # 最小学习率
+        scheduler_type: "linear-warmup_cosine-decay"
+        warmup_epochs: 0            # 预热的epoch比例
+        max_steps: 200000              # 总的训练步数
